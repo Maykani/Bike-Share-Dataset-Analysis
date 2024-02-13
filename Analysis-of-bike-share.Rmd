@@ -1,0 +1,383 @@
+---
+title: "Bike share analysis"
+output: html_document
+date: "2024-02-08"
+---
+```{r, echo=FALSE}
+setwd("C:/Users/maimo/OneDrive/Bureau/Bike_share_dataset")
+
+```
+
+IMPORTING REQUIRED PACKAGES
+
+```{r,echo = FALSE}
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(stats))
+suppressPackageStartupMessages(library(corrplot))
+suppressPackageStartupMessages(library(highcharter))
+suppressPackageStartupMessages(library(dygraphs))
+suppressPackageStartupMessages(library(zoo))
+suppressPackageStartupMessages(library(urca))
+suppressPackageStartupMessages(library(forecast))
+
+```
+
+EXPLORING DATA
+
+
+```{r, echo = FALSE}
+day <- read.csv('day.csv')
+hour <- read.csv('hour.csv')
+```
+
+1. Preview data
+
+```{r, echo = FALSE}
+data <- hour
+data$date_time <- str_c(hour$dteday, '-',hour$hr)
+col <-c('date_time', colnames(data)[1:17])
+data$date_time <- str_c(hour$dteday, ' ',hour$hr)
+data <- data[col]
+data$date_time <- as.POSIXct(data$date_time, format = "%Y-%m-%d %H")
+```
+
+For the exploratory steps, We will work with the dataframe hour as it is complete and contain hour details. We store it as data.
+
+```{r}
+head(data)
+```
+
+2.Overview of data characteristics
+
+```{r,echo}
+
+nrow(data)
+colSums(is.na(data))
+data[duplicated(data),]
+colnames(data)
+str(data)
+```
+
+3. Converting data type
+
+```{r, echo = FALSE}
+data$dteday <- as.Date(data$dteday)
+cols <- c('season','holiday','weekday','workingday', 'mnth','yr','weathersit')
+data[,cols] <- lapply(data[,cols], as.factor)
+
+```
+
+
+```{r}
+str(data)
+```
+
+4.Recoding data
+
+```{r, echo = FALSE}
+cols <- c('season','holiday','weekday','workingday', 'mnth','yr','weathersit')
+data[,cols] <- lapply(data[,cols], as.factor)
+levels(data$season) <- c('Winter', 'Spring', 'Summer', 'Fall')
+levels(data$weekday)<- c('Sunday','Monday', 'Tuesday', 'Wednesday', 'Thursday','Friday', 'Saturday')
+levels(data$workingday) <- c('No', 'Yes')
+levels(data$mnth) <- month.name
+levels(data$holiday)<- c('No', 'Yes')
+levels(data$yr) <- c('2011', '2012')
+levels(data$weathersit) <- c('Clear', 'Mist+Cloudy', 'Light rain/Light Sow', 'Heavy rain/Snow')
+
+```
+
+
+```{r}
+levels(data$season)
+levels(data$mnth)
+levels(data$weekday)
+levels(data$holiday)
+```
+
+
+5.Summary satistics
+
+```{r}
+summary(data)
+```
+
+6. Screening variables relationship
+The main variable we will study is cnt which represent the total rental bikes. It will represent our outcome that we want to forecast.
+We will make some cross tab to assess how our outcome (cnt) varies depending on the main features.
+
+```{r}
+data%>%
+group_by(season)%>%
+summarise(mean_cnt= mean(cnt))
+```
+
+We can notice that summer seems to be the best moment of of the year for bike renting.
+
+```{r}
+data %>%
+group_by(workingday)%>%
+summarise(mean_cnt = mean(cnt))
+
+```
+
+We can also notice that mean bike usage is greater during working day.
+
+```{r}
+
+data %>%
+group_by(hr)%>%
+summarise(mean_cnt = mean(cnt))%>%
+print(n=23)
+
+```
+Considering this table,the best hour for bike renting is noticed in the evening.
+
+
+Number of bikers vs weather situation
+
+```{r}
+i <- ggplot(data, aes(weathersit, cnt, color = yr))
+i+geom_col()
+
+```
+
+Clear weather seems to be the best moment for bike renting.
+
+
+Correlation between temperature and number of bikes
+
+```{r}
+
+i <- ggplot(data, aes(temp, cnt))
+i+geom_jitter()
+cor(data$temp, data$cnt)
+
+```
+
+The plot and the output of correlation value (0.4) shows there is probably a moderate positive correlation between normalized temperature and number of bikes
+
+Number of bikers vs holiday
+```{r}
+
+i <- ggplot(data, aes(holiday, cnt, color = holiday))
+i+geom_boxplot()
+
+```
+
+We can notice that we have on average less bike renting during holidays than other days.
+
+
+Correlation matrice of number of bikes and other numeric features.
+
+```{r}
+
+data_num <- data[, c('temp', 'cnt', 'atemp', 'hum', 'windspeed')]
+cor(data_num)
+corrplot(cor(data_num))
+
+```
+
+We can notice that there is moderate positive correlation between number of bikes and varibale temp(temperature) and atemp(feeling temperature).
+Humidity appears to be negatively correlated with number of bikes.
+
+
+INTERACTIVE TIME SERIES PLOTS
+
+```{r, echo = FALSE}
+outcome <- data[, c("date_time", 'cnt')]
+graph <- dygraph(outcome, ylab = 'Number of bikers', main = 'Number of bikers per day')%>%dyRangeSelector()
+
+```
+
+```{r}
+graph
+```
+
+SMOOTHEN TIMESERIES DATA
+To smoothen timeseries data, we will work with daily data and apply a moving average of 15 days period. 
+Notice also that for the rest of our analysis, this daily data will be used for forecasting.Indeed, in this type of business, predicting daily bike renting seems to be more relevant for management purpose.
+
+
+1. Removing outliers
+```{r, echo = FALSE}
+data <- day
+detect_outlier <- function(x){
+     Quantile1 <- quantile(x, probs=.25)
+     Quantile3 <- quantile(x, probs=.75)
+     IQR = Quantile3-Quantile1
+     x > Quantile3 + (IQR*1.5) | x < Quantile1 - (IQR*1.5)}
+
+remove_outlier <- function(dataframe, columns=names(dataframe)) {
+     for (col in columns) {
+         dataframe <- dataframe[!detect_outlier(dataframe[[col]]), ]}
+ 
+ }
+remove_outlier(data,c("cnt"))
+```
+
+2. Smoothing data
+
+```{r,echo = FALSE}
+data <- data%>%
+mutate(moving_average = rollmean(cnt, k = 15, fill = NA))
+data$dteday <- as.Date(data$dteday)
+
+graph <- dygraph(data[, c('dteday', 'moving_average')], ylab = 'Number of bikers(moving_average)', main = 'Average Number of bikers')%>%dyRangeSelector()
+```
+
+
+```{r}
+head(data)
+```
+
+2. Graph of smoothen data
+
+```{r}
+graph
+```
+CHECKING IF DATA IS STATIONARY
+
+Stationary is important as its guarantee the feasibility of some statisical tests. Indeed, most of parametric analysis require that statistical properties(mean, variance, covariance) do not change over time.
+
+```{r, echo=FALSE}
+
+inds <- seq(as.Date("2011-01-01"), as.Date("2012-12-31"), by = "day")
+tsData <- ts(data$cnt, start = c(2011, as.numeric(format(inds[1], "%j"))), frequency = 365)
+
+```
+
+
+```{r}
+Box.test(tsData)
+
+acf(tsData)
+
+summary(ur.kpss(tsData))
+
+```
+
+Our p-value of box test is less than 0.05 (p-value < 2.2e-16). In a similar vein, ACF values are above the confidence interval. We can conclude that data are non stationary. The KPSS test also confirmed that our data is non stationary as the test result (5.5176) is much higher than critical values.
+
+DECOMPOSE TIME SERIES DATA
+
+```{r, echo = FALSE}
+comp <- decompose(tsData)
+```
+
+```{r}
+plot(comp)
+
+```
+
+Decomposition shows that the trend is slightly upward and the noise is negligible. Seasonal components capture the entire series plot. Therefore we will include an seasonal differencing once building our forecasting model. 
+
+BUILDING AN AUTOARIMA MODEL FOR FORECASTING
+
+```{r}
+comp$trend <- na.omit(comp$trend)
+comp$seasonal <- na.omit(comp$seasonal)
+
+```
+
+
+```{r, echo =FALSE}
+train_start = 1
+train_end= length(tsData)*80/100
+test_start = train_end + 1
+test_end  = length(tsData)
+train_data = data$cnt[train_start: train_end]
+test_data = data$cnt[test_start: test_end]
+
+ts_train = ts(data = train_data, start = data$dteday[train_start], end = data$dteday[train_end])
+ts_test = ts(data = test_data, start = data$dteday[test_start], end = data$dteday[test_end])
+```
+
+```{r}
+length(ts_train)
+length(ts_test)
+```
+
+1. Autoarima model
+
+AUTO ARIMA is suitable for non stationary and seasonal data. It will automatically compute differencing.
+
+
+```{r}
+data_train <- data[train_start:train_end,]
+model <- auto.arima(ts_train)
+checkresiduals(model)
+shapiro.test(residuals(model))
+```
+
+Auto.arima residuals checking indicate that residual are not correlated but the distribution is skewed. Let's try different ARIMA models.
+
+2. ARIMA MODEL
+
+```{r}
+pacf(diff(comp$trend))
+acf(diff(comp$trend))
+pacf(diff(comp$seasonal))
+acf(diff(comp$seasonal))
+```
+(0,0) and (0,3) are p,q order for the non seasonal part
+(4,0), (0,1), (4,1) are P,Q order for the seasonal compounds
+p refer to the number of lag for which pacf cut of (pacf of diff data)
+d = refer to degree of differencing
+q refer to the number of lag for which acf cut off
+
+
+```{r,echo = FALSE}
+ARIMA_1 <- arima(ts_train, order=c(0,1,0),seasonal = list(order = c(4,1,0), period =7), method ='ML')
+aic_1 <- summary(ARIMA_1)$aic
+ARIMA_2 <- arima(ts_train, order=c(0,1,0),seasonal = list(order = c(0,1,1), period = 7), method = 'ML')
+aic_2 <- summary(ARIMA_2)$aic
+ARIMA_3 <- arima(ts_train, order=c(0,1,3),seasonal = list(order = c(4,1,0), period = 7), method = 'ML')
+aic_3 <- summary(ARIMA_3)$aic
+
+ARIMA_4 <- arima(ts_train, order=c(0,1,3),seasonal = list(order = c(0,1,1), period = 7), method ='ML')
+aic_4 <- summary(ARIMA_4)$aic
+
+ARIMA_5 <- arima(ts_train, order=c(0,1,0),seasonal = list(order = c(4,1,0), period = 7), method ='ML')
+aic_5 <- summary(ARIMA_5)$aic
+
+ARIMA_6 <- arima(ts_train, order=c(0,1,4),seasonal = list(order = c(4,1,1), period = 7), method ='ML')
+aic_6 <- summary(ARIMA_6)$aic
+
+best_aic <- min(aic_1, aic_2, aic_3, aic_4, aic_5,aic_6)
+list(aic_1, aic_2, aic_3, aic_4, aic_5, aic_6) == best_aic
+
+ARIMA_4_1 <- arima(ts_train, order=c(0,1,3),seasonal = list(order = c(0,1,1), period = 30), method ='ML')
+aic_4_1 <- summary(ARIMA_4_1)$aic
+
+ARIMA_4_2 <- arima(ts_train, order=c(0,1,3),seasonal = list(order = c(0,1,1), period = 90), method ='ML')
+aic_4_2 <- summary(ARIMA_4_2)$aic
+
+ ARIMA_4_3 <- arima(ts_train, order=c(0,1,3),seasonal = list(order = c(0,1,1), period = 180), method ='ML')
+aic_4_3 <- summary(ARIMA_4_3)$aic
+ 
+ARIMA_4_4 <- arima(ts_train, order=c(0,1,3),seasonal = list(order = c(0,1,1), period = 300), method ='ML')
+aic_4_4 <- summary(ARIMA_4_4)$aic
+Best_aic <- min(aic_4_1, aic_4_2, aic_4_3, aic_4_4)
+list(aic_4_1, aic_4_2, aic_4_3, aic_4_4) == Best_aic
+``` 
+We screened the best order parameters then we also screened the best period parameters(monthly, quarterly, semestrially, and yearly)
+
+The best model is  : ARIMA_4_4 <- arima(ts_train, order=c(0,1,3),seasonal = list(order = c(0,1,1), period = 300), method ='ML')
+
+3. Forecasting and Evaluating the model performance
+
+```{r, echo =FALSE}
+forecasts <- forecast(ARIMA_4_4, h = length(ts_test))
+```
+
+```{r}
+accuracy(forecasts, ts_test)
+```
+
+We can notice that the mean absolute error of our model is 429.6 in our training set and 1757.9 in our test set. When considering the Mean Average Percentage Error, it is reasonable on our training set(12.7%) but quite large in our test set (190.8). Our model perform quite good on our training set but is less perfomant on the test. Having data for a larger period of time will probably improve our forecast. We could also try other forecasting method.
+
+```{r}
+plot(forecasts)
+```
+
